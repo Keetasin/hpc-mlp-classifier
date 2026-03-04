@@ -187,10 +187,10 @@ int main() {
     int total_train_size, train_label_size, test_size, test_label_size;
 
     cout << "Loading datasets..." << endl;
-    read_mnist_images("data/train-images-idx3-ubyte", h_train_X, total_train_size);
-    read_mnist_labels("data/train-labels-idx1-ubyte", h_train_Y, train_label_size);
-    read_mnist_images("data/t10k-images-idx3-ubyte", h_test_X, test_size);
-    read_mnist_labels("data/t10k-labels-idx1-ubyte", h_test_Y, test_label_size);
+    read_mnist_images("train-images-idx3-ubyte", h_train_X, total_train_size);
+    read_mnist_labels("train-labels-idx1-ubyte", h_train_Y, train_label_size);
+    read_mnist_images("t10k-images-idx3-ubyte", h_test_X, test_size);
+    read_mnist_labels("t10k-labels-idx1-ubyte", h_test_Y, test_label_size);
     if(total_train_size == 0 || test_size == 0 || total_train_size != train_label_size) return 1;
 
     // --- Data Splitting ---
