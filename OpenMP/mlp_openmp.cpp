@@ -62,13 +62,141 @@ void read_mnist_labels(string filename, float*& labels, int& num_labels) {
 }
 
 // ==========================================
-// 3. FUSED OpenMP Kernels 
+// 3. FUSED OpenMP Kernels (Optimized)
 // ==========================================
+void train_batch(const float* __restrict__ X, const float* __restrict__ Y, 
+                 float* __restrict__ W1, float* __restrict__ W2,
+                 float* __restrict__ H, float* __restrict__ O,
+                 float* __restrict__ dZ1, float* __restrict__ dZ2,
+                 float& batch_loss, int& batch_correct) {
+                     
+    int local_correct = 0;
+    float local_loss = 0.0f;
+    float inv_batch = 1.0f / BATCH_SIZE;
 
-// Fused Forward 1: X * W1 -> H -> Relu
-void forward1(const float* __restrict__ X, const float* __restrict__ W1, float* __restrict__ H) {
-    #pragma omp parallel for schedule(static)
+    // FORK ครั้งเดียวต่อ 1 Batch
+    #pragma omp parallel
+    {
+        // TASK 1: Forward 1, Forward 2, Loss, Backward 1
+        #pragma omp for reduction(+:local_correct, local_loss) schedule(static)
+        for (int i = 0; i < BATCH_SIZE; ++i) {
+            // Forward 1: X * W1 -> H
+            memset(&H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
+            for (int k = 0; k < INPUT_SIZE; ++k) {
+                float x_val = X[i * INPUT_SIZE + k];
+                #pragma omp simd
+                for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                    H[i * HIDDEN_SIZE + j] += x_val * W1[k * HIDDEN_SIZE + j];
+                }
+            }
+            #pragma omp simd
+            for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                H[i * HIDDEN_SIZE + j] = H[i * HIDDEN_SIZE + j] > 0.0f ? H[i * HIDDEN_SIZE + j] : 0.0f;
+            }
+
+            // Forward 2: H * W2 -> O
+            float* o_row = &O[i * OUTPUT_SIZE];
+            memset(o_row, 0, OUTPUT_SIZE * sizeof(float));
+            for (int k = 0; k < HIDDEN_SIZE; ++k) {
+                float h_val = H[i * HIDDEN_SIZE + k];
+                #pragma omp simd
+                for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                    o_row[j] += h_val * W2[k * OUTPUT_SIZE + j];
+                }
+            }
+
+            // Softmax & Evaluation
+            float max_val = o_row[0];
+            for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = max_val > o_row[j] ? max_val : o_row[j];
+            float sum = 0.0f;
+            for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                o_row[j] = expf(o_row[j] - max_val);
+                sum += o_row[j];
+            }
+            float inv_sum = 1.0f / sum;
+
+            int y_true = (int)Y[i];
+            int best_class = 0;
+            float max_prob = -1.0f;
+            float prob_correct = 1e-7f;
+            float* dz2_row = &dZ2[i * OUTPUT_SIZE];
+            
+            for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                o_row[j] *= inv_sum;
+                if (o_row[j] > max_prob) { max_prob = o_row[j]; best_class = j; }
+                if (j == y_true) prob_correct = o_row[j] > 1e-7f ? o_row[j] : 1e-7f;
+                dz2_row[j] = (o_row[j] - (j == y_true ? 1.0f : 0.0f)) * inv_batch;
+            }
+            if (best_class == y_true) local_correct++;
+            local_loss += -logf(prob_correct);
+
+            // Backward 1: dZ2 * W2^T -> dH -> ReLU Deriv -> dZ1
+            float* dz1_row = &dZ1[i * HIDDEN_SIZE];
+            const float* h_row = &H[i * HIDDEN_SIZE];
+            for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                float sum_dz1 = 0.0f;
+                const float* w2_row = &W2[j * OUTPUT_SIZE];
+                #pragma omp simd reduction(+:sum_dz1)
+                for (int k = 0; k < OUTPUT_SIZE; ++k) {
+                    sum_dz1 += dz2_row[k] * w2_row[k]; 
+                }
+                dz1_row[j] = (h_row[j] > 0.0f) ? sum_dz1 : 0.0f; 
+            }
+        } 
+
+        // TASK 2: Update W2
+        #pragma omp for schedule(static)
+        for (int row = 0; row < HIDDEN_SIZE; ++row) {
+            float dw2_row[OUTPUT_SIZE] = {0}; 
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                float h_val = H[i * HIDDEN_SIZE + row];
+                const float* dz2_row = &dZ2[i * OUTPUT_SIZE];
+                #pragma omp simd
+                for (int col = 0; col < OUTPUT_SIZE; ++col) {
+                    dw2_row[col] += h_val * dz2_row[col];
+                }
+            }
+            #pragma omp simd
+            for (int col = 0; col < OUTPUT_SIZE; ++col) {
+                W2[row * OUTPUT_SIZE + col] -= LEARNING_RATE * dw2_row[col];
+            }
+        }
+
+        // TASK 3: Update W1
+        #pragma omp for schedule(static)
+        for (int row = 0; row < INPUT_SIZE; ++row) {
+            float dw1_row[HIDDEN_SIZE] = {0}; 
+            for (int i = 0; i < BATCH_SIZE; ++i) {
+                float x_val = X[i * INPUT_SIZE + row];
+                const float* dz1_row = &dZ1[i * HIDDEN_SIZE];
+                #pragma omp simd
+                for (int col = 0; col < HIDDEN_SIZE; ++col) {
+                    dw1_row[col] += x_val * dz1_row[col];
+                }
+            }
+            #pragma omp simd
+            for (int col = 0; col < HIDDEN_SIZE; ++col) {
+                W1[row * HIDDEN_SIZE + col] -= LEARNING_RATE * dw1_row[col];
+            }
+        }
+    }
+
+    batch_correct = local_correct;
+    batch_loss = local_loss;
+}
+
+// Kernel สำหรับ Validation และ Test
+void eval_batch(const float* __restrict__ X, const float* __restrict__ Y, 
+                const float* __restrict__ W1, const float* __restrict__ W2,
+                float* __restrict__ H, float* __restrict__ O,
+                float& batch_loss, int& batch_correct) {
+                    
+    int local_correct = 0;
+    float local_loss = 0.0f;
+
+    #pragma omp parallel for reduction(+:local_correct, local_loss) schedule(static)
     for (int i = 0; i < BATCH_SIZE; ++i) {
+        // Forward 1: X * W1 -> H
         memset(&H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
         for (int k = 0; k < INPUT_SIZE; ++k) {
             float x_val = X[i * INPUT_SIZE + k];
@@ -81,21 +209,10 @@ void forward1(const float* __restrict__ X, const float* __restrict__ W1, float* 
         for (int j = 0; j < HIDDEN_SIZE; ++j) {
             H[i * HIDDEN_SIZE + j] = H[i * HIDDEN_SIZE + j] > 0.0f ? H[i * HIDDEN_SIZE + j] : 0.0f;
         }
-    }
-}
 
-// Fused Forward 2 (Train): H * W2 -> O -> Softmax -> Eval -> dZ2
-void forward2_train(const float* __restrict__ H, const float* __restrict__ W2, float* __restrict__ O, 
-                    const float* __restrict__ Y, float* __restrict__ dZ2, float& total_loss, int& total_correct) {
-    int local_correct = 0;
-    float local_loss = 0.0f;
-    float inv_batch = 1.0f / BATCH_SIZE;
-
-    #pragma omp parallel for reduction(+:local_correct, local_loss) schedule(static)
-    for (int i = 0; i < BATCH_SIZE; ++i) {
+        // Forward 2: H * W2 -> O
         float* o_row = &O[i * OUTPUT_SIZE];
         memset(o_row, 0, OUTPUT_SIZE * sizeof(float));
-        
         for (int k = 0; k < HIDDEN_SIZE; ++k) {
             float h_val = H[i * HIDDEN_SIZE + k];
             #pragma omp simd
@@ -103,142 +220,33 @@ void forward2_train(const float* __restrict__ H, const float* __restrict__ W2, f
                 o_row[j] += h_val * W2[k * OUTPUT_SIZE + j];
             }
         }
-        
+
+        // Softmax & Evaluation
         float max_val = o_row[0];
         for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = max_val > o_row[j] ? max_val : o_row[j];
-        
         float sum = 0.0f;
         for (int j = 0; j < OUTPUT_SIZE; ++j) {
             o_row[j] = expf(o_row[j] - max_val);
             sum += o_row[j];
         }
         float inv_sum = 1.0f / sum;
-        #pragma omp simd
-        for (int j = 0; j < OUTPUT_SIZE; ++j) o_row[j] *= inv_sum;
 
         int y_true = (int)Y[i];
         int best_class = 0;
-        float max_prob = o_row[0];
-        float prob_correct = 1e-7f;
-        float* dz2_row = &dZ2[i * OUTPUT_SIZE];
-        
-        for (int j = 0; j < OUTPUT_SIZE; ++j) {
-            if (o_row[j] > max_prob) { max_prob = o_row[j]; best_class = j; }
-            if (j == y_true) prob_correct = o_row[j] > 1e-7f ? o_row[j] : 1e-7f;
-            dz2_row[j] = (o_row[j] - (j == y_true ? 1.0f : 0.0f)) * inv_batch;
-        }
-        if (best_class == y_true) local_correct++;
-        local_loss += -logf(prob_correct);
-    }
-    total_correct += local_correct;
-    total_loss += local_loss;
-}
-
-// Fused Forward 2 (Validation/Test)
-void forward2_eval(const float* __restrict__ H, const float* __restrict__ W2, float* __restrict__ O, 
-                   const float* __restrict__ Y, float& total_loss, int& total_correct) {
-    int local_correct = 0;
-    float local_loss = 0.0f;
-
-    #pragma omp parallel for reduction(+:local_correct, local_loss) schedule(static)
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-        float* o_row = &O[i * OUTPUT_SIZE];
-        memset(o_row, 0, OUTPUT_SIZE * sizeof(float));
-        
-        for (int k = 0; k < HIDDEN_SIZE; ++k) {
-            float h_val = H[i * HIDDEN_SIZE + k];
-            #pragma omp simd
-            for (int j = 0; j < OUTPUT_SIZE; ++j) {
-                o_row[j] += h_val * W2[k * OUTPUT_SIZE + j];
-            }
-        }
-        
-        float max_val = o_row[0];
-        for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = max_val > o_row[j] ? max_val : o_row[j];
-        
-        float sum = 0.0f;
-        for (int j = 0; j < OUTPUT_SIZE; ++j) {
-            o_row[j] = expf(o_row[j] - max_val);
-            sum += o_row[j];
-        }
-        float inv_sum = 1.0f / sum;
-        #pragma omp simd
-        for (int j = 0; j < OUTPUT_SIZE; ++j) o_row[j] *= inv_sum;
-
-        int y_true = (int)Y[i];
-        int best_class = 0;
-        float max_prob = o_row[0];
+        float max_prob = -1.0f;
         float prob_correct = 1e-7f;
         
         for (int j = 0; j < OUTPUT_SIZE; ++j) {
+            o_row[j] *= inv_sum;
             if (o_row[j] > max_prob) { max_prob = o_row[j]; best_class = j; }
             if (j == y_true) prob_correct = o_row[j] > 1e-7f ? o_row[j] : 1e-7f;
         }
         if (best_class == y_true) local_correct++;
         local_loss += -logf(prob_correct);
     }
-    total_correct += local_correct;
-    total_loss += local_loss;
-}
-
-// Fused Backward 1: dZ2 * W2^T -> dH -> ReLU Deriv -> dZ1
-void backward1(const float* __restrict__ dZ2, const float* __restrict__ W2, const float* __restrict__ H, float* __restrict__ dZ1) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-        const float* dz2_row = &dZ2[i * OUTPUT_SIZE];
-        float* dz1_row = &dZ1[i * HIDDEN_SIZE];
-        const float* h_row = &H[i * HIDDEN_SIZE];
-        
-        for (int j = 0; j < HIDDEN_SIZE; ++j) {
-            float sum = 0.0f;
-            const float* w2_row = &W2[j * OUTPUT_SIZE];
-            #pragma omp simd reduction(+:sum)
-            for (int k = 0; k < OUTPUT_SIZE; ++k) {
-                sum += dz2_row[k] * w2_row[k]; 
-            }
-            dz1_row[j] = (h_row[j] > 0.0f) ? sum : 0.0f; 
-        }
-    }
-}
-
-// Fused Backward 2: H^T * dZ2 -> dW2 -> Update W2 
-void update_W2(const float* __restrict__ H, const float* __restrict__ dZ2, float* __restrict__ W2) {
-    #pragma omp parallel for schedule(static)
-    for (int row = 0; row < HIDDEN_SIZE; ++row) {
-        float dw2_row[OUTPUT_SIZE] = {0}; 
-        for (int i = 0; i < BATCH_SIZE; ++i) {
-            float h_val = H[i * HIDDEN_SIZE + row];
-            const float* dz2_row = &dZ2[i * OUTPUT_SIZE];
-            #pragma omp simd
-            for (int col = 0; col < OUTPUT_SIZE; ++col) {
-                dw2_row[col] += h_val * dz2_row[col];
-            }
-        }
-        #pragma omp simd
-        for (int col = 0; col < OUTPUT_SIZE; ++col) {
-            W2[row * OUTPUT_SIZE + col] -= LEARNING_RATE * dw2_row[col];
-        }
-    }
-}
-
-// Fused Backward 3: X^T * dZ1 -> dW1 -> Update W1
-void update_W1(const float* __restrict__ X, const float* __restrict__ dZ1, float* __restrict__ W1) {
-    #pragma omp parallel for schedule(static)
-    for (int row = 0; row < INPUT_SIZE; ++row) {
-        float dw1_row[HIDDEN_SIZE] = {0}; 
-        for (int i = 0; i < BATCH_SIZE; ++i) {
-            float x_val = X[i * INPUT_SIZE + row];
-            const float* dz1_row = &dZ1[i * HIDDEN_SIZE];
-            #pragma omp simd
-            for (int col = 0; col < HIDDEN_SIZE; ++col) {
-                dw1_row[col] += x_val * dz1_row[col];
-            }
-        }
-        #pragma omp simd
-        for (int col = 0; col < HIDDEN_SIZE; ++col) {
-            W1[row * HIDDEN_SIZE + col] -= LEARNING_RATE * dw1_row[col];
-        }
-    }
+    
+    batch_correct = local_correct;
+    batch_loss = local_loss;
 }
 
 // ==========================================
@@ -295,13 +303,13 @@ int main() {
             memcpy(d_X, h_train_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
             memcpy(d_Y, h_train_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-            forward1(d_X, d_W1, d_H);
-            forward2_train(d_H, d_W2, d_O, d_Y, d_dZ2, train_loss_total, correct_train);
+            int b_correct = 0;
+            float b_loss = 0.0f;
             
-            backward1(d_dZ2, d_W2, d_H, d_dZ1);
+            train_batch(d_X, d_Y, d_W1, d_W2, d_H, d_O, d_dZ1, d_dZ2, b_loss, b_correct);
             
-            update_W2(d_H, d_dZ2, d_W2);
-            update_W1(d_X, d_dZ1, d_W1);
+            correct_train += b_correct;
+            train_loss_total += b_loss;
         }
 
         auto train_end = chrono::high_resolution_clock::now();
@@ -319,8 +327,13 @@ int main() {
             memcpy(d_X, h_train_X + (train_samples + b * BATCH_SIZE) * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
             memcpy(d_Y, h_train_Y + (train_samples + b * BATCH_SIZE), BATCH_SIZE * sizeof(float));
 
-            forward1(d_X, d_W1, d_H);
-            forward2_eval(d_H, d_W2, d_O, d_Y, val_loss_total, correct_val);
+            int b_correct = 0;
+            float b_loss = 0.0f;
+            
+            eval_batch(d_X, d_Y, d_W1, d_W2, d_H, d_O, b_loss, b_correct);
+            
+            correct_val += b_correct;
+            val_loss_total += b_loss;
         }
         
         final_val_acc = (float)correct_val / (val_batches * BATCH_SIZE) * 100.0f;
@@ -338,8 +351,13 @@ int main() {
         memcpy(d_X, h_test_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
         memcpy(d_Y, h_test_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-        forward1(d_X, d_W1, d_H);
-        forward2_eval(d_H, d_W2, d_O, d_Y, test_loss_total, correct_test);
+        int b_correct = 0;
+        float b_loss = 0.0f;
+        
+        eval_batch(d_X, d_Y, d_W1, d_W2, d_H, d_O, b_loss, b_correct);
+        
+        correct_test += b_correct;
+        test_loss_total += b_loss;
     }
     
     final_test_acc = (float)correct_test / (test_batches * BATCH_SIZE) * 100.0f;
