@@ -62,28 +62,35 @@ void read_mnist_labels(string filename, float*& labels, int& num_labels) {
 }
 
 // ==========================================
-// 3. CPU Math Functions (Replacing CUDA)
+// 3. CPU Math Functions (Cache Optimized)
 // ==========================================
+// C = A * B
 void matmul(float* A, float* B, float* C, int M, int N, int K) {
+    for (int i = 0; i < M * N; ++i) C[i] = 0.0f;
     for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; ++k) sum += A[i * K + k] * B[k * N + j];
-            C[i * N + j] = sum;
+        for (int k = 0; k < K; ++k) {
+            float a = A[i * K + k];
+            for (int j = 0; j < N; ++j) {
+                C[i * N + j] += a * B[k * N + j];
+            }
         }
     }
 }
 
+// C = A^T * B
 void matMulTransposeA(float* A, float* B, float* C, int M, int N, int K) {
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; ++k) sum += A[k * M + i] * B[k * N + j];
-            C[i * N + j] = sum;
+    for (int i = 0; i < M * N; ++i) C[i] = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        for (int i = 0; i < M; ++i) {
+            float a = A[k * M + i];
+            for (int j = 0; j < N; ++j) {
+                C[i * N + j] += a * B[k * N + j];
+            }
         }
     }
 }
 
+// C = A * B^T
 void matMulTransposeB(float* A, float* B, float* C, int M, int N, int K) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -137,7 +144,6 @@ void compute_dz2(float* O, float* Y, float* dz2, int batch_size, int global_batc
     for (int row = 0; row < batch_size; ++row) {
         for (int col = 0; col < num_classes; ++col) {
             float y_val = (Y[row] == col) ? 1.0f : 0.0f;
-            // หารด้วย Global Batch Size เพื่อให้ Gradient รวมกันได้อย่างถูกต้องในทุก processes
             dz2[row * num_classes + col] = (O[row * num_classes + col] - y_val) / global_batch_size;
         }
     }
@@ -167,7 +173,6 @@ int main(int argc, char** argv) {
 
     if (rank == 0) cout << "Loading datasets..." << endl;
     
-    // ทุก Process โหลด Data เพื่อความสะดวก (หรือสามารถให้ Rank 0 โหลดแล้ว Scatter ได้)
     read_mnist_images("train-images-idx3-ubyte", h_train_X, total_train_size);
     read_mnist_labels("train-labels-idx1-ubyte", h_train_Y, train_label_size);
     read_mnist_images("t10k-images-idx3-ubyte", h_test_X, test_size);
@@ -193,13 +198,20 @@ int main(int argc, char** argv) {
     float *Y = new float[local_batch_size];
     float *H = new float[local_batch_size * HIDDEN_SIZE];
     float *O = new float[local_batch_size * OUTPUT_SIZE];
-    float *dW1 = new float[INPUT_SIZE * HIDDEN_SIZE];
-    float *dW2 = new float[HIDDEN_SIZE * OUTPUT_SIZE];
+    
+    // --- MPI OPTIMIZATION: Message Coalescing ---
+    int size_dW1 = INPUT_SIZE * HIDDEN_SIZE;
+    int size_dW2 = HIDDEN_SIZE * OUTPUT_SIZE;
+    float *dW_buffer = new float[size_dW1 + size_dW2];
+    
+    float *dW1 = dW_buffer;
+    float *dW2 = dW_buffer + size_dW1;
+    // --------------------------------------------
+
     float *dZ1 = new float[local_batch_size * HIDDEN_SIZE];
     float *dZ2 = new float[local_batch_size * OUTPUT_SIZE];
     float *dH = new float[local_batch_size * HIDDEN_SIZE];
 
-    // Rank 0 สุ่ม Weights และแจกจ่าย (Broadcast) ให้ทุก Ranks
     if (rank == 0) {
         for (int i = 0; i < INPUT_SIZE * HIDDEN_SIZE; i++) W1[i] = ((float)rand() / RAND_MAX - 0.5f) * sqrtf(2.0f / INPUT_SIZE);
         for (int i = 0; i < HIDDEN_SIZE * OUTPUT_SIZE; i++) W2[i] = ((float)rand() / RAND_MAX - 0.5f) * sqrtf(2.0f / HIDDEN_SIZE);
@@ -207,7 +219,7 @@ int main(int argc, char** argv) {
     MPI_Bcast(W1, INPUT_SIZE * HIDDEN_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
     MPI_Bcast(W2, HIDDEN_SIZE * OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) cout << "\nStarting Distributed Training on " << size << " MPI Processes..." << endl;
+    if (rank == 0) cout << "\nStarting Training ..." << endl;
     
     double total_train_time = 0.0;
     float final_train_acc = 0.0f, final_val_acc = 0.0f, final_test_acc = 0.0f;
@@ -225,7 +237,6 @@ int main(int argc, char** argv) {
         float train_loss_local = 0.0f, train_loss_global = 0.0f;
 
         for (int b = 0; b < train_batches; b++) {
-            // ดึงข้อมูลเฉพาะส่วนของ Process ปัจจุบัน
             int offset = (b * BATCH_SIZE) + (rank * local_batch_size);
             for(int i=0; i<local_batch_size * INPUT_SIZE; ++i) X[i] = h_train_X[offset * INPUT_SIZE + i];
             for(int i=0; i<local_batch_size; ++i) Y[i] = h_train_Y[offset + i];
@@ -248,19 +259,17 @@ int main(int argc, char** argv) {
             relu_backward(dH, H, dZ1, local_batch_size * HIDDEN_SIZE);
             matMulTransposeA(X, dZ1, dW1, INPUT_SIZE, HIDDEN_SIZE, local_batch_size);
 
-            // MPI Allreduce: รวม Gradient จากทุก Process
-            MPI_Allreduce(MPI_IN_PLACE, dW1, INPUT_SIZE * HIDDEN_SIZE, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, dW2, HIDDEN_SIZE * OUTPUT_SIZE, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            // --- MPI OPTIMIZATION: Allreduce ครั้งเดียว ---
+            MPI_Allreduce(MPI_IN_PLACE, dW_buffer, size_dW1 + size_dW2, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
 
             // Update Weights
-            update_weights(W1, dW1, LEARNING_RATE, INPUT_SIZE * HIDDEN_SIZE);
-            update_weights(W2, dW2, LEARNING_RATE, HIDDEN_SIZE * OUTPUT_SIZE);
+            update_weights(W1, dW1, LEARNING_RATE, size_dW1);
+            update_weights(W2, dW2, LEARNING_RATE, size_dW2);
         }
         
         double train_end = MPI_Wtime();
         total_train_time += (train_end - train_start);
 
-        // รวม Loss และ Accuracy ของทั้ง Epoch
         MPI_Allreduce(&correct_train_local, &correct_train_global, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         MPI_Allreduce(&train_loss_local, &train_loss_global, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
         
@@ -344,11 +353,11 @@ int main(int argc, char** argv) {
         cout << "===============================================" << endl;
     }
 
-    // Free memory
     delete[] h_train_X; delete[] h_train_Y; delete[] h_test_X; delete[] h_test_Y;
     delete[] W1; delete[] W2;
     delete[] X; delete[] Y; delete[] H; delete[] O;
-    delete[] dW1; delete[] dW2; delete[] dZ1; delete[] dZ2; delete[] dH;
+    delete[] dW_buffer; 
+    delete[] dZ1; delete[] dZ2; delete[] dH;
 
     MPI_Finalize();
     return 0;

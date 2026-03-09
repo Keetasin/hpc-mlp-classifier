@@ -6,7 +6,6 @@ import pyspark
 from pyspark import SparkConf, SparkContext
 import warnings
 
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # ==========================================
@@ -32,24 +31,22 @@ def read_mnist_labels(filename):
     with open(filename, 'rb') as f:
         magic, num_labels = struct.unpack(">II", f.read(8))
         labels = np.frombuffer(f.read(), dtype=np.uint8)
-        return labels.astype(np.float32)
+        return labels.astype(np.int32) 
 
 # ==========================================
-# 3. Neural Network Functions
+# 3. Ultra-Optimized Neural Network Functions
 # ==========================================
-def relu(x):
-    return np.maximum(0, x)
-
-def relu_backward(dH, H):
-    return dH * (H > 0)
-
-def softmax(x):
-    exps = np.exp(x - np.max(x, axis=1, keepdims=True))
-    return exps / np.sum(exps, axis=1, keepdims=True)
-
 def forward_pass(X, W1, W2):
-    H = relu(np.dot(X, W1))
-    O = softmax(np.dot(H, W2))
+    H = np.dot(X, W1)
+    np.maximum(H, 0.0, out=H) 
+    
+    O = np.dot(H, W2)
+    max_O = np.max(O, axis=1, keepdims=True)
+    np.subtract(O, max_O, out=O)
+    np.exp(O, out=O)
+    sum_O = np.sum(O, axis=1, keepdims=True)
+    np.divide(O, sum_O, out=O)
+    
     return H, O
 
 def compute_loss_and_correct(O, Y):
@@ -57,23 +54,22 @@ def compute_loss_and_correct(O, Y):
     predictions = np.argmax(O, axis=1)
     correct = np.sum(predictions == Y)
     
-    # Clip probabilities to prevent log(0)
-    probs = np.clip(O[np.arange(batch_size), Y.astype(int)], 1e-7, 1.0)
+    probs = np.clip(O[np.arange(batch_size), Y], 1e-7, 1.0)
     loss = -np.sum(np.log(probs))
     return loss, correct
 
 def backward_pass(X, Y, H, O, W2):
     batch_size = X.shape[0]
     
-    Y_one_hot = np.zeros((batch_size, OUTPUT_SIZE))
-    Y_one_hot[np.arange(batch_size), Y.astype(int)] = 1.0
+    dZ2 = O.copy() 
+    dZ2[np.arange(batch_size), Y] -= 1.0
+    dZ2 /= batch_size
     
-    dZ2 = (O - Y_one_hot) / batch_size
     dW2 = np.dot(H.T, dZ2)
     dH = np.dot(dZ2, W2.T)
     
-    dZ1 = relu_backward(dH, H)
-    dW1 = np.dot(X.T, dZ1)
+    dH[H <= 0] = 0.0 
+    dW1 = np.dot(X.T, dH)
     
     return dW1, dW2
 
@@ -81,7 +77,6 @@ def backward_pass(X, Y, H, O, W2):
 # 4. Partition Functions (Local SGD)
 # ==========================================
 def train_partition(iterator, W1_bc, W2_bc, learning_rate):
-    # Copy weights locally to update them inside the partition
     W1_local = np.copy(W1_bc.value)
     W2_local = np.copy(W2_bc.value)
     
@@ -97,7 +92,7 @@ def train_partition(iterator, W1_bc, W2_bc, learning_rate):
         loss, correct = compute_loss_and_correct(O, Y_batch)
         dW1, dW2 = backward_pass(X_batch, Y_batch, H, O, W2_local)
         
-        # MINI-BATCH UPDATE: Update local weights immediately!
+        # In-place updates for weights
         W1_local -= learning_rate * dW1
         W2_local -= learning_rate * dW2
         
@@ -105,7 +100,6 @@ def train_partition(iterator, W1_bc, W2_bc, learning_rate):
         total_correct += correct
         total_samples += X_batch.shape[0]
         
-    # Yield the updated weights and metrics back to the driver
     yield (W1_local, W2_local, total_loss, total_correct, total_samples)
 
 def eval_partition(iterator, W1_bc, W2_bc):
@@ -131,7 +125,8 @@ def eval_partition(iterator, W1_bc, W2_bc):
 # 5. Main Training Loop
 # ==========================================
 def main():
-    conf = SparkConf().setAppName("MLP_PySpark_6610110425")
+    conf = SparkConf().setAppName("MLP_PySpark") \
+                      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     sc = SparkContext(conf=conf)
     
     print("Loading datasets...")
@@ -170,17 +165,16 @@ def main():
     test_batches = create_batches(test_X, test_Y, BATCH_SIZE)
 
     np.random.seed(42)
-    W1 = (np.random.rand(INPUT_SIZE, HIDDEN_SIZE) - 0.5) * np.sqrt(2.0 / INPUT_SIZE)
-    W2 = (np.random.rand(HIDDEN_SIZE, OUTPUT_SIZE) - 0.5) * np.sqrt(2.0 / HIDDEN_SIZE)
+    W1 = ((np.random.rand(INPUT_SIZE, HIDDEN_SIZE) - 0.5) * np.sqrt(2.0 / INPUT_SIZE)).astype(np.float32)
+    W2 = ((np.random.rand(HIDDEN_SIZE, OUTPUT_SIZE) - 0.5) * np.sqrt(2.0 / HIDDEN_SIZE)).astype(np.float32)
 
-    print("\nStarting Training...")
+    print("\nStarting Ultra-Fast PySpark Training...")
     
     total_train_time = 0.0
     
     num_train_batches = len(train_batches)
     num_partitions = min(8, num_train_batches) 
     
-    # Cache RDDs
     train_rdd = sc.parallelize(train_batches, numSlices=num_partitions).cache()
     val_rdd = sc.parallelize(val_batches, numSlices=num_partitions).cache()
     test_rdd = sc.parallelize(test_batches, numSlices=num_partitions).cache()
@@ -196,13 +190,11 @@ def main():
         
         train_start = time.time()
 
-        # --- 1. TRAIN PHASE (Local SGD using mapPartitions) ---
         train_results = train_rdd.mapPartitions(lambda it: train_partition(it, W1_bc, W2_bc, LEARNING_RATE)) \
-                                 .reduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]))
+                                 .treeReduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]))
         
         sum_W1, sum_W2, total_loss, total_correct, total_samples = train_results
         
-        # FEDERATED AVERAGING: Average the locally trained weights from all partitions
         W1 = sum_W1 / actual_train_partitions
         W2 = sum_W2 / actual_train_partitions
 
@@ -220,7 +212,7 @@ def main():
         W2_val_bc = sc.broadcast(W2)
         
         val_results = val_rdd.mapPartitions(lambda it: eval_partition(it, W1_val_bc, W2_val_bc)) \
-                             .reduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2]))
+                             .treeReduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2]))
         
         val_total_loss, val_total_correct, val_total_samples = val_results
         
@@ -239,7 +231,7 @@ def main():
     W2_test_bc = sc.broadcast(W2)
     
     test_results = test_rdd.mapPartitions(lambda it: eval_partition(it, W1_test_bc, W2_test_bc)) \
-                           .reduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2]))
+                           .treeReduce(lambda a, b: (a[0] + b[0], a[1] + b[1], a[2] + b[2]))
     
     test_total_loss, test_total_correct, test_total_samples = test_results
     

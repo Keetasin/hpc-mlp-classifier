@@ -5,7 +5,10 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
-#include <algorithm>
+#include <condition_variable>
+#include <atomic>
+#include <functional>
+#include <cstring> 
 
 using namespace std;
 
@@ -19,11 +22,72 @@ using namespace std;
 #define EPOCHS 100       // จำนวนรอบในการเทรน
 #define LEARNING_RATE 0.05f // อัตราการเรียนรู้
 
-// Number of threads to use (adjust based on your system)
-unsigned int NUM_THREADS = std::thread::hardware_concurrency();
+const int NUM_THREADS = 8; // กำหนดจำนวน Threads 
 
 // ==========================================
-// 2. Data Loading Functions (IDX Format)
+// 2. Simple Thread Pool 
+// ==========================================
+class SimpleThreadPool {
+    vector<thread> threads;
+    function<void(int)> current_task;
+    atomic<int> completed_threads;
+    atomic<int> generation;
+    mutex mtx;
+    condition_variable cv_start, cv_end;
+    bool stop = false;
+    int num_threads;
+
+public:
+    SimpleThreadPool(int n) : num_threads(n), completed_threads(0), generation(0) {
+        for (int i = 0; i < n; ++i) {
+            threads.emplace_back([this, i] {
+                int my_gen = 0;
+                while (true) {
+                    unique_lock<mutex> lock(mtx);
+                    cv_start.wait(lock, [this, my_gen] { return stop || generation > my_gen; });
+                    if (stop) return;
+                    my_gen = generation;
+                    lock.unlock();
+
+                    current_task(i);
+
+                    if (++completed_threads == num_threads) {
+                        unique_lock<mutex> lock_end(mtx);
+                        cv_end.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    ~SimpleThreadPool() {
+        {
+            unique_lock<mutex> lock(mtx);
+            stop = true;
+            generation++;
+        }
+        cv_start.notify_all();
+        for (auto& t : threads) t.join();
+    }
+
+    void execute(function<void(int)> task) {
+        {
+            unique_lock<mutex> lock(mtx);
+            current_task = task;
+            completed_threads = 0;
+            generation++;
+        }
+        cv_start.notify_all();
+
+        unique_lock<mutex> lock(mtx);
+        cv_end.wait(lock, [this] { return completed_threads == num_threads; });
+    }
+};
+
+SimpleThreadPool* pool = nullptr;
+
+// ==========================================
+// 3. Data Loading Functions (IDX Format)
 // ==========================================
 int reverseInt(int i) {
     unsigned char c1, c2, c3, c4;
@@ -66,271 +130,23 @@ void read_mnist_labels(string filename, float*& labels, int& num_labels) {
 }
 
 // ==========================================
-// 3. C++ Thread Functions
-// ==========================================
-
-void matrixMulWorker(float* A, float* B, float* C, int M, int N, int K, int start_row, int end_row) {
-    for (int row = start_row; row < end_row; ++row) {
-        for (int col = 0; col < N; ++col) {
-            float Cvalue = 0.0f;
-            for (int p = 0; p < K; ++p) {
-                Cvalue += A[row * K + p] * B[p * N + col];
-            }
-            C[row * N + col] = Cvalue;
-        }
-    }
-}
-
-void matrixMul(float* A, float* B, float* C, int M, int N, int K) {
-    vector<thread> threads;
-    int chunk_size = (M + NUM_THREADS - 1) / NUM_THREADS;
-    
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, M);
-        if (start_row < M) {
-            threads.emplace_back(matrixMulWorker, A, B, C, M, N, K, start_row, end_row);
-        }
-    }
-    
-    for (auto& th : threads) th.join();
-}
-
-void reluWorker(float* d_out, int start_idx, int end_idx) {
-    for (int idx = start_idx; idx < end_idx; ++idx) {
-        d_out[idx] = fmaxf(0.0f, d_out[idx]);
-    }
-}
-
-void relu(float* d_out, int size) {
-    vector<thread> threads;
-    int chunk_size = (size + NUM_THREADS - 1) / NUM_THREADS;
-    
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_idx = t * chunk_size;
-        int end_idx = min(start_idx + chunk_size, size);
-        if (start_idx < size) {
-            threads.emplace_back(reluWorker, d_out, start_idx, end_idx);
-        }
-    }
-    
-    for (auto& th : threads) th.join();
-}
-
-void softmaxWorker(float* d_out, int num_classes, int start_row, int end_row) {
-    for (int row = start_row; row < end_row; ++row) {
-        float max_val = d_out[row * num_classes];
-        for (int i = 1; i < num_classes; ++i) {
-            max_val = fmaxf(max_val, d_out[row * num_classes + i]);
-        }
-        float sum = 0.0f;
-        for (int i = 0; i < num_classes; ++i) {
-            d_out[row * num_classes + i] = expf(d_out[row * num_classes + i] - max_val);
-            sum += d_out[row * num_classes + i];
-        }
-        for (int i = 0; i < num_classes; ++i) {
-            d_out[row * num_classes + i] /= sum;
-        }
-    }
-}
-
-void softmax(float* d_out, int batch_size, int num_classes) {
-    vector<thread> threads;
-    int chunk_size = (batch_size + NUM_THREADS - 1) / NUM_THREADS;
-    
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, batch_size);
-        if (start_row < batch_size) {
-            threads.emplace_back(softmaxWorker, d_out, num_classes, start_row, end_row);
-        }
-    }
-    
-    for (auto& th : threads) th.join();
-}
-
-void evaluateLossAccWorker(float* d_O, float* d_Y, float& local_loss, int& local_correct, int num_classes, int start_row, int end_row, mutex& mtx, float* global_loss, int* global_correct) {
-    int _correct = 0;
-    float _loss = 0.0f;
-    
-    for (int row = start_row; row < end_row; ++row) {
-        int best_class = 0;
-        float max_prob = d_O[row * num_classes];
-        float prob_correct = 1e-7f; 
-
-        for (int i = 0; i < num_classes; ++i) {
-            float p = d_O[row * num_classes + i];
-            if (p > max_prob) { 
-                max_prob = p; 
-                best_class = i; 
-            }
-            if (i == (int)d_Y[row]) prob_correct = fmaxf(p, 1e-7f); 
-        }
-
-        if (best_class == (int)d_Y[row]) _correct++;
-        _loss += -logf(prob_correct); 
-    }
-    
-    lock_guard<mutex> lock(mtx);
-    *global_correct += _correct;
-    *global_loss += _loss;
-}
-
-void evaluate_loss_acc(float* d_O, float* d_Y, float* d_loss, int* d_correct, int batch_size, int num_classes) {
-    vector<thread> threads;
-    mutex mtx;
-    int chunk_size = (batch_size + NUM_THREADS - 1) / NUM_THREADS;
-    
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, batch_size);
-        if (start_row < batch_size) {
-            float local_loss = 0;
-            int local_correct = 0;
-            threads.emplace_back(evaluateLossAccWorker, d_O, d_Y, ref(local_loss), ref(local_correct), num_classes, start_row, end_row, ref(mtx), d_loss, d_correct);
-        }
-    }
-    
-    for (auto& th : threads) th.join();
-}
-
-void computeDz2Worker(float* d_O, float* d_Y, float* dz2, int batch_size, int num_classes, int start_row, int end_row) {
-    for (int row = start_row; row < end_row; ++row) {
-        for (int col = 0; col < num_classes; ++col) {
-            int idx = row * num_classes + col;
-            float y_val = (d_Y[row] == col) ? 1.0f : 0.0f;
-            dz2[idx] = (d_O[idx] - y_val) / batch_size;
-        }
-    }
-}
-
-void compute_dz2(float* d_O, float* d_Y, float* dz2, int batch_size, int num_classes) {
-    vector<thread> threads;
-    int chunk_size = (batch_size + NUM_THREADS - 1) / NUM_THREADS;
-    
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, batch_size);
-        if (start_row < batch_size) {
-             threads.emplace_back(computeDz2Worker, d_O, d_Y, dz2, batch_size, num_classes, start_row, end_row);
-        }
-    }
-    for (auto& th : threads) th.join();
-}
-
-void matMulTransposeAWorker(float* A, float* B, float* C, int M, int N, int K, int start_row, int end_row) {
-     for (int row = start_row; row < end_row; ++row) {
-        for (int col = 0; col < N; ++col) {
-            float sum = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                sum += A[i * M + row] * B[i * N + col];
-            }
-            C[row * N + col] = sum;
-        }
-    }
-}
-
-void matMulTransposeA(float* A, float* B, float* C, int M, int N, int K) {
-    vector<thread> threads;
-    int chunk_size = (M + NUM_THREADS - 1) / NUM_THREADS;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, M);
-        if (start_row < M) {
-             threads.emplace_back(matMulTransposeAWorker, A, B, C, M, N, K, start_row, end_row);
-        }
-    }
-    for (auto& th : threads) th.join();
-}
-
-void matMulTransposeBWorker(float* A, float* B, float* C, int M, int N, int K, int start_row, int end_row) {
-    for (int row = start_row; row < end_row; ++row) {
-        for (int col = 0; col < N; ++col) {
-            float sum = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                sum += A[row * K + i] * B[col * K + i];
-            }
-            C[row * N + col] = sum;
-        }
-    }
-}
-
-void matMulTransposeB(float* A, float* B, float* C, int M, int N, int K) {
-    vector<thread> threads;
-    int chunk_size = (M + NUM_THREADS - 1) / NUM_THREADS;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_row = t * chunk_size;
-        int end_row = min(start_row + chunk_size, M);
-        if (start_row < M) {
-             threads.emplace_back(matMulTransposeBWorker, A, B, C, M, N, K, start_row, end_row);
-        }
-    }
-    for (auto& th : threads) th.join();
-}
-
-void reluBackwardWorker(float* dH, float* H, float* dZ1, int start_idx, int end_idx) {
-     for (int idx = start_idx; idx < end_idx; ++idx) {
-        dZ1[idx] = (H[idx] > 0.0f) ? dH[idx] : 0.0f;
-    }
-}
-
-void relu_backward(float* dH, float* H, float* dZ1, int size) {
-    vector<thread> threads;
-    int chunk_size = (size + NUM_THREADS - 1) / NUM_THREADS;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_idx = t * chunk_size;
-        int end_idx = min(start_idx + chunk_size, size);
-        if (start_idx < size) {
-             threads.emplace_back(reluBackwardWorker, dH, H, dZ1, start_idx, end_idx);
-        }
-    }
-    for (auto& th : threads) th.join();
-}
-
-void updateWeightsWorker(float* W, float* dW, float lr, int start_idx, int end_idx) {
-    for (int idx = start_idx; idx < end_idx; ++idx) {
-        W[idx] -= lr * dW[idx];
-    }
-}
-
-void update_weights(float* W, float* dW, float lr, int size) {
-    vector<thread> threads;
-    int chunk_size = (size + NUM_THREADS - 1) / NUM_THREADS;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start_idx = t * chunk_size;
-        int end_idx = min(start_idx + chunk_size, size);
-        if (start_idx < size) {
-             threads.emplace_back(updateWeightsWorker, W, dW, lr, start_idx, end_idx);
-        }
-    }
-    for (auto& th : threads) th.join();
-}
-
-// ==========================================
 // 4. Main Training Loop
 // ==========================================
 int main() {
-    // Determine the optimal number of threads based on hardware
-    NUM_THREADS = std::thread::hardware_concurrency();
-    if (NUM_THREADS == 0) NUM_THREADS = 4; // Fallback
-    
+    pool = new SimpleThreadPool(NUM_THREADS); 
+
     float *h_train_X, *h_train_Y, *h_test_X, *h_test_Y;
     int total_train_size, train_label_size, test_size, test_label_size;
 
     cout << "Loading datasets..." << endl;
-    cout << "Using " << NUM_THREADS << " hardware threads." << endl;
-    
-    // NOTE: Make sure the paths to the data files are correct for your system
     read_mnist_images("train-images-idx3-ubyte", h_train_X, total_train_size);
     read_mnist_labels("train-labels-idx1-ubyte", h_train_Y, train_label_size);
     read_mnist_images("t10k-images-idx3-ubyte", h_test_X, test_size);
     read_mnist_labels("t10k-labels-idx1-ubyte", h_test_Y, test_label_size);
     if(total_train_size == 0 || test_size == 0 || total_train_size != train_label_size) return 1;
 
-    // --- Data Splitting ---
     int train_samples = 50000;
     int val_samples = total_train_size - train_samples;
-
     int train_batches = train_samples / BATCH_SIZE;
     int val_batches = val_samples / BATCH_SIZE;
     int test_batches = test_size / BATCH_SIZE;
@@ -344,91 +160,256 @@ int main() {
 
     float *d_X = new float[BATCH_SIZE * INPUT_SIZE];
     float *d_Y = new float[BATCH_SIZE];
+    
     float *d_W1 = h_W1;
     float *d_W2 = h_W2;
     float *d_H = new float[BATCH_SIZE * HIDDEN_SIZE];
     float *d_O = new float[BATCH_SIZE * OUTPUT_SIZE];
-    float *d_dW1 = new float[INPUT_SIZE * HIDDEN_SIZE];
-    float *d_dW2 = new float[HIDDEN_SIZE * OUTPUT_SIZE];
     float *d_dZ1 = new float[BATCH_SIZE * HIDDEN_SIZE];
     float *d_dZ2 = new float[BATCH_SIZE * OUTPUT_SIZE];
-    float *d_dH = new float[BATCH_SIZE * HIDDEN_SIZE];
-    int d_correct;
-    float d_loss;
 
-    cout << "\nStarting Training..." << endl;
+    cout << "\nStarting Training ..." << endl;
 
     double total_train_time = 0.0;
     float final_train_acc = 0.0f, final_val_acc = 0.0f, final_test_acc = 0.0f;
     float final_train_loss = 0.0f, final_val_loss = 0.0f, final_test_loss = 0.0f;
 
+    int t_correct[128];
+    float t_loss[128];
+
     // ==========================================
-    // --- EPOCH LOOP (Train & Validation) ---
+    // --- EPOCH LOOP ---
     // ==========================================
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
 
         auto train_start = chrono::high_resolution_clock::now();
 
-        // --- 1. TRAIN PHASE ---
         int correct_train = 0;
         float train_loss_total = 0.0f;
-        d_correct = 0;
-        d_loss = 0.0f;
 
         for (int b = 0; b < train_batches; b++) {
-            copy(h_train_X + b * BATCH_SIZE * INPUT_SIZE, h_train_X + (b + 1) * BATCH_SIZE * INPUT_SIZE, d_X);
-            copy(h_train_Y + b * BATCH_SIZE, h_train_Y + (b + 1) * BATCH_SIZE, d_Y);
+            // Load batch to L1/L2 cache
+            memcpy(d_X, h_train_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+            memcpy(d_Y, h_train_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-            matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-            relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
+            for(int i=0; i<128; i++) { t_correct[i] = 0; t_loss[i] = 0.0f; }
 
-            matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-            softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
+            // TASK 1: MEGA-FUSION (Forward 1 + Forward 2 + Loss + Backward 1)
+            pool->execute([&](int t_id) {
+                int chunk = BATCH_SIZE / NUM_THREADS;
+                int start = t_id * chunk;
+                int end = (t_id == NUM_THREADS - 1) ? BATCH_SIZE : start + chunk;
 
-            evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
+                int local_correct = 0;
+                float local_loss = 0.0f;
+                float inv_batch = 1.0f / BATCH_SIZE;
 
-            compute_dz2(d_O, d_Y, d_dZ2, BATCH_SIZE, OUTPUT_SIZE);
-            
-            matMulTransposeA(d_H, d_dZ2, d_dW2, HIDDEN_SIZE, OUTPUT_SIZE, BATCH_SIZE);
-            matMulTransposeB(d_dZ2, d_W2, d_dH, BATCH_SIZE, HIDDEN_SIZE, OUTPUT_SIZE);
-            
-            relu_backward(d_dH, d_H, d_dZ1, BATCH_SIZE * HIDDEN_SIZE);
-            matMulTransposeA(d_X, d_dZ1, d_dW1, INPUT_SIZE, HIDDEN_SIZE, BATCH_SIZE);
+                for (int i = start; i < end; ++i) {
+                    // Forward 1: X * W1 -> H
+                    memset(&d_H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
+                    for (int k = 0; k < INPUT_SIZE; ++k) {
+                        float x_val = d_X[i * INPUT_SIZE + k];
+                        #pragma GCC ivdep
+                        for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                            d_H[i * HIDDEN_SIZE + j] += x_val * d_W1[k * HIDDEN_SIZE + j];
+                        }
+                    }
+                    #pragma GCC ivdep
+                    for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                        d_H[i * HIDDEN_SIZE + j] = fmaxf(0.0f, d_H[i * HIDDEN_SIZE + j]);
+                    }
 
-            update_weights(d_W1, d_dW1, LEARNING_RATE, INPUT_SIZE * HIDDEN_SIZE);
-            update_weights(d_W2, d_dW2, LEARNING_RATE, HIDDEN_SIZE * OUTPUT_SIZE);
+                    // Forward 2: H * W2 -> O
+                    memset(&d_O[i * OUTPUT_SIZE], 0, OUTPUT_SIZE * sizeof(float));
+                    for (int k = 0; k < HIDDEN_SIZE; ++k) {
+                        float h_val = d_H[i * HIDDEN_SIZE + k];
+                        #pragma GCC ivdep
+                        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                            d_O[i * OUTPUT_SIZE + j] += h_val * d_W2[k * OUTPUT_SIZE + j];
+                        }
+                    }
+
+                    // Softmax & Loss
+                    float* out_row = &d_O[i * OUTPUT_SIZE];
+                    float max_val = out_row[0];
+                    for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = fmaxf(max_val, out_row[j]);
+                    
+                    float sum = 0.0f;
+                    for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                        out_row[j] = expf(out_row[j] - max_val);
+                        sum += out_row[j];
+                    }
+                    float inv_sum = 1.0f / sum;
+
+                    int y_true = (int)d_Y[i];
+                    int best_class = 0;
+                    float max_prob = -1.0f;
+                    float prob_correct = 1e-7f;
+                    float* dz2_row = &d_dZ2[i * OUTPUT_SIZE];
+
+                    #pragma GCC ivdep
+                    for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                        out_row[j] *= inv_sum;
+                        if (out_row[j] > max_prob) { max_prob = out_row[j]; best_class = j; }
+                        if (j == y_true) prob_correct = fmaxf(out_row[j], 1e-7f);
+                        dz2_row[j] = (out_row[j] - (j == y_true ? 1.0f : 0.0f)) * inv_batch;
+                    }
+
+                    if (best_class == y_true) local_correct++;
+                    local_loss += -logf(prob_correct);
+
+                    // Backward 1: dZ2 * W2^T -> dH -> Relu Deriv -> dZ1
+                    float* dz1_row = &d_dZ1[i * HIDDEN_SIZE];
+                    const float* h_row = &d_H[i * HIDDEN_SIZE];
+                    for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                        float sum_dz1 = 0.0f;
+                        const float* w2_row = &d_W2[j * OUTPUT_SIZE];
+                        #pragma GCC ivdep
+                        for (int k = 0; k < OUTPUT_SIZE; ++k) {
+                            sum_dz1 += dz2_row[k] * w2_row[k];
+                        }
+                        dz1_row[j] = (h_row[j] > 0.0f) ? sum_dz1 : 0.0f; 
+                    }
+                }
+                t_correct[t_id * 16] = local_correct;
+                t_loss[t_id * 16] = local_loss;
+            });
+
+            for (int i = 0; i < NUM_THREADS; ++i) {
+                correct_train += t_correct[i * 16];
+                train_loss_total += t_loss[i * 16];
+            }
+
+            // TASK 2: Update W2 (Memory Elision - วาง Array ลง Stack ตรงๆ)
+            pool->execute([&](int t_id) {
+                int chunk = HIDDEN_SIZE / NUM_THREADS;
+                int start = t_id * chunk;
+                int end = (t_id == NUM_THREADS - 1) ? HIDDEN_SIZE : start + chunk;
+                
+                for (int row = start; row < end; ++row) {
+                    float dw2_row[OUTPUT_SIZE] = {0}; 
+                    for (int i = 0; i < BATCH_SIZE; ++i) {
+                        float h_val = d_H[i * HIDDEN_SIZE + row];
+                        const float* dz2_row = &d_dZ2[i * OUTPUT_SIZE];
+                        #pragma GCC ivdep
+                        for (int col = 0; col < OUTPUT_SIZE; ++col) {
+                            dw2_row[col] += h_val * dz2_row[col];
+                        }
+                    }
+                    #pragma GCC ivdep
+                    for (int col = 0; col < OUTPUT_SIZE; ++col) {
+                        d_W2[row * OUTPUT_SIZE + col] -= LEARNING_RATE * dw2_row[col];
+                    }
+                }
+            });
+
+            // TASK 3: Update W1 (Memory Elision - วาง Array ลง Stack ตรงๆ)
+            pool->execute([&](int t_id) {
+                int chunk = INPUT_SIZE / NUM_THREADS;
+                int start = t_id * chunk;
+                int end = (t_id == NUM_THREADS - 1) ? INPUT_SIZE : start + chunk;
+                
+                for (int row = start; row < end; ++row) {
+                    float dw1_row[HIDDEN_SIZE] = {0}; 
+                    for (int i = 0; i < BATCH_SIZE; ++i) {
+                        float x_val = d_X[i * INPUT_SIZE + row];
+                        const float* dz1_row = &d_dZ1[i * HIDDEN_SIZE];
+                        #pragma GCC ivdep
+                        for (int col = 0; col < HIDDEN_SIZE; ++col) {
+                            dw1_row[col] += x_val * dz1_row[col];
+                        }
+                    }
+                    #pragma GCC ivdep
+                    for (int col = 0; col < HIDDEN_SIZE; ++col) {
+                        d_W1[row * HIDDEN_SIZE + col] -= LEARNING_RATE * dw1_row[col];
+                    }
+                }
+            });
         }
 
         auto train_end = chrono::high_resolution_clock::now();
         chrono::duration<double> epoch_time = train_end - train_start;
         total_train_time += epoch_time.count();
 
-        correct_train = d_correct;
-        train_loss_total = d_loss;
         final_train_acc = (float)correct_train / (train_batches * BATCH_SIZE) * 100.0f;
         final_train_loss = train_loss_total / (train_batches * BATCH_SIZE);
 
-        // --- 2. VALIDATION PHASE ---
+        // --- VALIDATION PHASE ---
         int correct_val = 0;
         float val_loss_total = 0.0f;
-        d_correct = 0;
-        d_loss = 0.0f;
 
         for (int b = 0; b < val_batches; b++) {
-            copy(h_train_X + (train_samples + b * BATCH_SIZE) * INPUT_SIZE, h_train_X + (train_samples + (b + 1) * BATCH_SIZE) * INPUT_SIZE, d_X);
-            copy(h_train_Y + train_samples + b * BATCH_SIZE, h_train_Y + train_samples + (b + 1) * BATCH_SIZE, d_Y);
+            memcpy(d_X, h_train_X + (train_samples + b * BATCH_SIZE) * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+            memcpy(d_Y, h_train_Y + (train_samples + b * BATCH_SIZE), BATCH_SIZE * sizeof(float));
 
-            matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-            relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
+            for(int i=0; i<128; i++) { t_correct[i] = 0; t_loss[i] = 0.0f; }
 
-            matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-            softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
+            pool->execute([&](int t_id) {
+                int chunk = BATCH_SIZE / NUM_THREADS;
+                int start = t_id * chunk;
+                int end = (t_id == NUM_THREADS - 1) ? BATCH_SIZE : start + chunk;
 
-            evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
+                int local_correct = 0;
+                float local_loss = 0.0f;
+
+                for (int i = start; i < end; ++i) {
+                    memset(&d_H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
+                    for (int k = 0; k < INPUT_SIZE; ++k) {
+                        float a_val = d_X[i * INPUT_SIZE + k];
+                        #pragma GCC ivdep
+                        for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                            d_H[i * HIDDEN_SIZE + j] += a_val * d_W1[k * HIDDEN_SIZE + j];
+                        }
+                    }
+                    #pragma GCC ivdep
+                    for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                        d_H[i * HIDDEN_SIZE + j] = fmaxf(0.0f, d_H[i * HIDDEN_SIZE + j]);
+                    }
+
+                    memset(&d_O[i * OUTPUT_SIZE], 0, OUTPUT_SIZE * sizeof(float));
+                    for (int k = 0; k < HIDDEN_SIZE; ++k) {
+                        float h_val = d_H[i * HIDDEN_SIZE + k];
+                        #pragma GCC ivdep
+                        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                            d_O[i * OUTPUT_SIZE + j] += h_val * d_W2[k * OUTPUT_SIZE + j];
+                        }
+                    }
+
+                    float* out_row = &d_O[i * OUTPUT_SIZE];
+                    float max_val = out_row[0];
+                    for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = fmaxf(max_val, out_row[j]);
+                    
+                    float sum = 0.0f;
+                    for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                        out_row[j] = expf(out_row[j] - max_val);
+                        sum += out_row[j];
+                    }
+                    float inv_sum = 1.0f / sum;
+
+                    int y_true = (int)d_Y[i];
+                    int best_class = 0;
+                    float max_prob = -1.0f;
+                    float prob_correct = 1e-7f;
+
+                    #pragma GCC ivdep
+                    for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                        out_row[j] *= inv_sum;
+                        if (out_row[j] > max_prob) { max_prob = out_row[j]; best_class = j; }
+                        if (j == y_true) prob_correct = fmaxf(out_row[j], 1e-7f);
+                    }
+                    if (best_class == y_true) local_correct++;
+                    local_loss += -logf(prob_correct);
+                }
+                t_correct[t_id * 16] = local_correct;
+                t_loss[t_id * 16] = local_loss;
+            });
+
+            for (int i = 0; i < NUM_THREADS; ++i) {
+                correct_val += t_correct[i * 16];
+                val_loss_total += t_loss[i * 16];
+            }
         }
         
-        correct_val = d_correct;
-        val_loss_total = d_loss;
         final_val_acc = (float)correct_val / (val_batches * BATCH_SIZE) * 100.0f;
         final_val_loss = val_loss_total / (val_batches * BATCH_SIZE);
 
@@ -441,24 +422,79 @@ int main() {
     // ==========================================
     int correct_test = 0;
     float test_loss_total = 0.0f;
-    d_correct = 0;
-    d_loss = 0.0f;
 
     for (int b = 0; b < test_batches; b++) {
-        copy(h_test_X + b * BATCH_SIZE * INPUT_SIZE, h_test_X + (b + 1) * BATCH_SIZE * INPUT_SIZE, d_X);
-        copy(h_test_Y + b * BATCH_SIZE, h_test_Y + (b + 1) * BATCH_SIZE, d_Y);
+        memcpy(d_X, h_test_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+        memcpy(d_Y, h_test_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-        matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-        relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
+        for(int i=0; i<128; i++) { t_correct[i] = 0; t_loss[i] = 0.0f; }
 
-        matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-        softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
+        pool->execute([&](int t_id) {
+            int chunk = BATCH_SIZE / NUM_THREADS;
+            int start = t_id * chunk;
+            int end = (t_id == NUM_THREADS - 1) ? BATCH_SIZE : start + chunk;
 
-        evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
+            int local_correct = 0;
+            float local_loss = 0.0f;
+
+            for (int i = start; i < end; ++i) {
+                memset(&d_H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
+                for (int k = 0; k < INPUT_SIZE; ++k) {
+                    float a_val = d_X[i * INPUT_SIZE + k];
+                    #pragma GCC ivdep
+                    for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                        d_H[i * HIDDEN_SIZE + j] += a_val * d_W1[k * HIDDEN_SIZE + j];
+                    }
+                }
+                #pragma GCC ivdep
+                for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                    d_H[i * HIDDEN_SIZE + j] = fmaxf(0.0f, d_H[i * HIDDEN_SIZE + j]);
+                }
+
+                memset(&d_O[i * OUTPUT_SIZE], 0, OUTPUT_SIZE * sizeof(float));
+                for (int k = 0; k < HIDDEN_SIZE; ++k) {
+                    float h_val = d_H[i * HIDDEN_SIZE + k];
+                    #pragma GCC ivdep
+                    for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                        d_O[i * OUTPUT_SIZE + j] += h_val * d_W2[k * OUTPUT_SIZE + j];
+                    }
+                }
+
+                float* out_row = &d_O[i * OUTPUT_SIZE];
+                float max_val = out_row[0];
+                for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = fmaxf(max_val, out_row[j]);
+                
+                float sum = 0.0f;
+                for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                    out_row[j] = expf(out_row[j] - max_val);
+                    sum += out_row[j];
+                }
+                float inv_sum = 1.0f / sum;
+
+                int y_true = (int)d_Y[i];
+                int best_class = 0;
+                float max_prob = -1.0f;
+                float prob_correct = 1e-7f;
+
+                #pragma GCC ivdep
+                for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                    out_row[j] *= inv_sum;
+                    if (out_row[j] > max_prob) { max_prob = out_row[j]; best_class = j; }
+                    if (j == y_true) prob_correct = fmaxf(out_row[j], 1e-7f);
+                }
+                if (best_class == y_true) local_correct++;
+                local_loss += -logf(prob_correct);
+            }
+            t_correct[t_id * 16] = local_correct;
+            t_loss[t_id * 16] = local_loss;
+        });
+
+        for (int i = 0; i < NUM_THREADS; ++i) {
+            correct_test += t_correct[i * 16];
+            test_loss_total += t_loss[i * 16];
+        }
     }
     
-    correct_test = d_correct;
-    test_loss_total = d_loss;
     final_test_acc = (float)correct_test / (test_batches * BATCH_SIZE) * 100.0f;
     final_test_loss = test_loss_total / (test_batches * BATCH_SIZE);
 
@@ -486,8 +522,9 @@ int main() {
     printf("%-20s : %.3f GFLOPS\n", "Throughput", gflops);
     cout << "===============================================" << endl;
 
+    delete pool; 
     delete[] d_X; delete[] d_Y; delete[] d_H; delete[] d_O;
-    delete[] d_dW1; delete[] d_dW2; delete[] d_dZ1; delete[] d_dZ2; delete[] d_dH;
+    delete[] d_dZ1; delete[] d_dZ2; 
     delete[] h_train_X; delete[] h_train_Y; delete[] h_test_X; delete[] h_test_Y;
     delete[] h_W1; delete[] h_W2;
 

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <chrono>
 #include <omp.h>
+#include <cstring> 
 
 using namespace std;
 
@@ -61,121 +62,182 @@ void read_mnist_labels(string filename, float*& labels, int& num_labels) {
 }
 
 // ==========================================
-// 3. OpenMP Functions
+// 3. FUSED OpenMP Kernels 
 // ==========================================
-void matrixMul(float* A, float* B, float* C, int M, int N, int K) {
-    #pragma omp parallel for collapse(2)
-    for (int row = 0; row < M; ++row) {
-        for (int col = 0; col < N; ++col) {
-            float Cvalue = 0.0f;
-            for (int p = 0; p < K; ++p) {
-                Cvalue += A[row * K + p] * B[p * N + col];
+
+// Fused Forward 1: X * W1 -> H -> Relu
+void forward1(const float* __restrict__ X, const float* __restrict__ W1, float* __restrict__ H) {
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        memset(&H[i * HIDDEN_SIZE], 0, HIDDEN_SIZE * sizeof(float));
+        for (int k = 0; k < INPUT_SIZE; ++k) {
+            float x_val = X[i * INPUT_SIZE + k];
+            #pragma omp simd
+            for (int j = 0; j < HIDDEN_SIZE; ++j) {
+                H[i * HIDDEN_SIZE + j] += x_val * W1[k * HIDDEN_SIZE + j];
             }
-            C[row * N + col] = Cvalue;
+        }
+        #pragma omp simd
+        for (int j = 0; j < HIDDEN_SIZE; ++j) {
+            H[i * HIDDEN_SIZE + j] = H[i * HIDDEN_SIZE + j] > 0.0f ? H[i * HIDDEN_SIZE + j] : 0.0f;
         }
     }
 }
 
-void relu(float* d_out, int size) {
-    #pragma omp parallel for
-    for (int idx = 0; idx < size; ++idx) {
-        d_out[idx] = fmaxf(0.0f, d_out[idx]);
-    }
-}
+// Fused Forward 2 (Train): H * W2 -> O -> Softmax -> Eval -> dZ2
+void forward2_train(const float* __restrict__ H, const float* __restrict__ W2, float* __restrict__ O, 
+                    const float* __restrict__ Y, float* __restrict__ dZ2, float& total_loss, int& total_correct) {
+    int local_correct = 0;
+    float local_loss = 0.0f;
+    float inv_batch = 1.0f / BATCH_SIZE;
 
-void softmax(float* d_out, int batch_size, int num_classes) {
-    #pragma omp parallel for
-    for (int row = 0; row < batch_size; ++row) {
-        float max_val = d_out[row * num_classes];
-        for (int i = 1; i < num_classes; ++i) {
-            max_val = fmaxf(max_val, d_out[row * num_classes + i]);
+    #pragma omp parallel for reduction(+:local_correct, local_loss) schedule(static)
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        float* o_row = &O[i * OUTPUT_SIZE];
+        memset(o_row, 0, OUTPUT_SIZE * sizeof(float));
+        
+        for (int k = 0; k < HIDDEN_SIZE; ++k) {
+            float h_val = H[i * HIDDEN_SIZE + k];
+            #pragma omp simd
+            for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                o_row[j] += h_val * W2[k * OUTPUT_SIZE + j];
+            }
         }
+        
+        float max_val = o_row[0];
+        for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = max_val > o_row[j] ? max_val : o_row[j];
+        
         float sum = 0.0f;
-        for (int i = 0; i < num_classes; ++i) {
-            d_out[row * num_classes + i] = expf(d_out[row * num_classes + i] - max_val);
-            sum += d_out[row * num_classes + i];
+        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+            o_row[j] = expf(o_row[j] - max_val);
+            sum += o_row[j];
         }
-        for (int i = 0; i < num_classes; ++i) {
-            d_out[row * num_classes + i] /= sum;
+        float inv_sum = 1.0f / sum;
+        #pragma omp simd
+        for (int j = 0; j < OUTPUT_SIZE; ++j) o_row[j] *= inv_sum;
+
+        int y_true = (int)Y[i];
+        int best_class = 0;
+        float max_prob = o_row[0];
+        float prob_correct = 1e-7f;
+        float* dz2_row = &dZ2[i * OUTPUT_SIZE];
+        
+        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+            if (o_row[j] > max_prob) { max_prob = o_row[j]; best_class = j; }
+            if (j == y_true) prob_correct = o_row[j] > 1e-7f ? o_row[j] : 1e-7f;
+            dz2_row[j] = (o_row[j] - (j == y_true ? 1.0f : 0.0f)) * inv_batch;
         }
+        if (best_class == y_true) local_correct++;
+        local_loss += -logf(prob_correct);
     }
+    total_correct += local_correct;
+    total_loss += local_loss;
 }
 
-void evaluate_loss_acc(float* d_O, float* d_Y, float* d_loss, int* d_correct, int batch_size, int num_classes) {
+// Fused Forward 2 (Validation/Test)
+void forward2_eval(const float* __restrict__ H, const float* __restrict__ W2, float* __restrict__ O, 
+                   const float* __restrict__ Y, float& total_loss, int& total_correct) {
     int local_correct = 0;
     float local_loss = 0.0f;
 
-    #pragma omp parallel for reduction(+:local_correct, local_loss)
-    for (int row = 0; row < batch_size; ++row) {
+    #pragma omp parallel for reduction(+:local_correct, local_loss) schedule(static)
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        float* o_row = &O[i * OUTPUT_SIZE];
+        memset(o_row, 0, OUTPUT_SIZE * sizeof(float));
+        
+        for (int k = 0; k < HIDDEN_SIZE; ++k) {
+            float h_val = H[i * HIDDEN_SIZE + k];
+            #pragma omp simd
+            for (int j = 0; j < OUTPUT_SIZE; ++j) {
+                o_row[j] += h_val * W2[k * OUTPUT_SIZE + j];
+            }
+        }
+        
+        float max_val = o_row[0];
+        for (int j = 1; j < OUTPUT_SIZE; ++j) max_val = max_val > o_row[j] ? max_val : o_row[j];
+        
+        float sum = 0.0f;
+        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+            o_row[j] = expf(o_row[j] - max_val);
+            sum += o_row[j];
+        }
+        float inv_sum = 1.0f / sum;
+        #pragma omp simd
+        for (int j = 0; j < OUTPUT_SIZE; ++j) o_row[j] *= inv_sum;
+
+        int y_true = (int)Y[i];
         int best_class = 0;
-        float max_prob = d_O[row * num_classes];
-        float prob_correct = 1e-7f; 
-
-        for (int i = 0; i < num_classes; ++i) {
-            float p = d_O[row * num_classes + i];
-            if (p > max_prob) { 
-                max_prob = p; 
-                best_class = i; 
-            }
-            if (i == (int)d_Y[row]) prob_correct = fmaxf(p, 1e-7f); 
+        float max_prob = o_row[0];
+        float prob_correct = 1e-7f;
+        
+        for (int j = 0; j < OUTPUT_SIZE; ++j) {
+            if (o_row[j] > max_prob) { max_prob = o_row[j]; best_class = j; }
+            if (j == y_true) prob_correct = o_row[j] > 1e-7f ? o_row[j] : 1e-7f;
         }
-
-        if (best_class == (int)d_Y[row]) local_correct++;
-        local_loss += -logf(prob_correct); 
+        if (best_class == y_true) local_correct++;
+        local_loss += -logf(prob_correct);
     }
-    
-    *d_correct += local_correct;
-    *d_loss += local_loss;
+    total_correct += local_correct;
+    total_loss += local_loss;
 }
 
-void compute_dz2(float* d_O, float* d_Y, float* dz2, int batch_size, int num_classes) {
-    #pragma omp parallel for collapse(2)
-    for (int row = 0; row < batch_size; ++row) {
-        for (int col = 0; col < num_classes; ++col) {
-            int idx = row * num_classes + col;
-            float y_val = (d_Y[row] == col) ? 1.0f : 0.0f;
-            dz2[idx] = (d_O[idx] - y_val) / batch_size;
-        }
-    }
-}
-
-void matMulTransposeA(float* A, float* B, float* C, int M, int N, int K) {
-    #pragma omp parallel for collapse(2)
-    for (int row = 0; row < M; ++row) {
-        for (int col = 0; col < N; ++col) {
+// Fused Backward 1: dZ2 * W2^T -> dH -> ReLU Deriv -> dZ1
+void backward1(const float* __restrict__ dZ2, const float* __restrict__ W2, const float* __restrict__ H, float* __restrict__ dZ1) {
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        const float* dz2_row = &dZ2[i * OUTPUT_SIZE];
+        float* dz1_row = &dZ1[i * HIDDEN_SIZE];
+        const float* h_row = &H[i * HIDDEN_SIZE];
+        
+        for (int j = 0; j < HIDDEN_SIZE; ++j) {
             float sum = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                sum += A[i * M + row] * B[i * N + col];
+            const float* w2_row = &W2[j * OUTPUT_SIZE];
+            #pragma omp simd reduction(+:sum)
+            for (int k = 0; k < OUTPUT_SIZE; ++k) {
+                sum += dz2_row[k] * w2_row[k]; 
             }
-            C[row * N + col] = sum;
+            dz1_row[j] = (h_row[j] > 0.0f) ? sum : 0.0f; 
         }
     }
 }
 
-void matMulTransposeB(float* A, float* B, float* C, int M, int N, int K) {
-    #pragma omp parallel for collapse(2)
-    for (int row = 0; row < M; ++row) {
-        for (int col = 0; col < N; ++col) {
-            float sum = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                sum += A[row * K + i] * B[col * K + i];
+// Fused Backward 2: H^T * dZ2 -> dW2 -> Update W2 
+void update_W2(const float* __restrict__ H, const float* __restrict__ dZ2, float* __restrict__ W2) {
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < HIDDEN_SIZE; ++row) {
+        float dw2_row[OUTPUT_SIZE] = {0}; 
+        for (int i = 0; i < BATCH_SIZE; ++i) {
+            float h_val = H[i * HIDDEN_SIZE + row];
+            const float* dz2_row = &dZ2[i * OUTPUT_SIZE];
+            #pragma omp simd
+            for (int col = 0; col < OUTPUT_SIZE; ++col) {
+                dw2_row[col] += h_val * dz2_row[col];
             }
-            C[row * N + col] = sum;
+        }
+        #pragma omp simd
+        for (int col = 0; col < OUTPUT_SIZE; ++col) {
+            W2[row * OUTPUT_SIZE + col] -= LEARNING_RATE * dw2_row[col];
         }
     }
 }
 
-void relu_backward(float* dH, float* H, float* dZ1, int size) {
-    #pragma omp parallel for
-    for (int idx = 0; idx < size; ++idx) {
-        dZ1[idx] = (H[idx] > 0.0f) ? dH[idx] : 0.0f;
-    }
-}
-
-void update_weights(float* W, float* dW, float lr, int size) {
-    #pragma omp parallel for
-    for (int idx = 0; idx < size; ++idx) {
-        W[idx] -= lr * dW[idx];
+// Fused Backward 3: X^T * dZ1 -> dW1 -> Update W1
+void update_W1(const float* __restrict__ X, const float* __restrict__ dZ1, float* __restrict__ W1) {
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < INPUT_SIZE; ++row) {
+        float dw1_row[HIDDEN_SIZE] = {0}; 
+        for (int i = 0; i < BATCH_SIZE; ++i) {
+            float x_val = X[i * INPUT_SIZE + row];
+            const float* dz1_row = &dZ1[i * HIDDEN_SIZE];
+            #pragma omp simd
+            for (int col = 0; col < HIDDEN_SIZE; ++col) {
+                dw1_row[col] += x_val * dz1_row[col];
+            }
+        }
+        #pragma omp simd
+        for (int col = 0; col < HIDDEN_SIZE; ++col) {
+            W1[row * HIDDEN_SIZE + col] -= LEARNING_RATE * dw1_row[col];
+        }
     }
 }
 
@@ -193,10 +255,8 @@ int main() {
     read_mnist_labels("t10k-labels-idx1-ubyte", h_test_Y, test_label_size);
     if(total_train_size == 0 || test_size == 0 || total_train_size != train_label_size) return 1;
 
-    // --- Data Splitting ---
     int train_samples = 50000;
     int val_samples = total_train_size - train_samples;
-
     int train_batches = train_samples / BATCH_SIZE;
     int val_batches = val_samples / BATCH_SIZE;
     int test_batches = test_size / BATCH_SIZE;
@@ -210,91 +270,59 @@ int main() {
 
     float *d_X = new float[BATCH_SIZE * INPUT_SIZE];
     float *d_Y = new float[BATCH_SIZE];
+    
     float *d_W1 = h_W1;
     float *d_W2 = h_W2;
     float *d_H = new float[BATCH_SIZE * HIDDEN_SIZE];
     float *d_O = new float[BATCH_SIZE * OUTPUT_SIZE];
-    float *d_dW1 = new float[INPUT_SIZE * HIDDEN_SIZE];
-    float *d_dW2 = new float[HIDDEN_SIZE * OUTPUT_SIZE];
     float *d_dZ1 = new float[BATCH_SIZE * HIDDEN_SIZE];
     float *d_dZ2 = new float[BATCH_SIZE * OUTPUT_SIZE];
-    float *d_dH = new float[BATCH_SIZE * HIDDEN_SIZE];
-    int d_correct;
-    float d_loss;
 
-    cout << "\nStarting Training..." << endl;
+    cout << "\nStarting Training ..." << endl;
 
     double total_train_time = 0.0;
     float final_train_acc = 0.0f, final_val_acc = 0.0f, final_test_acc = 0.0f;
     float final_train_loss = 0.0f, final_val_loss = 0.0f, final_test_loss = 0.0f;
 
-    // ==========================================
-    // --- EPOCH LOOP (Train & Validation) ---
-    // ==========================================
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
 
         auto train_start = chrono::high_resolution_clock::now();
 
-        // --- 1. TRAIN PHASE ---
         int correct_train = 0;
         float train_loss_total = 0.0f;
-        d_correct = 0;
-        d_loss = 0.0f;
 
         for (int b = 0; b < train_batches; b++) {
-            copy(h_train_X + b * BATCH_SIZE * INPUT_SIZE, h_train_X + (b + 1) * BATCH_SIZE * INPUT_SIZE, d_X);
-            copy(h_train_Y + b * BATCH_SIZE, h_train_Y + (b + 1) * BATCH_SIZE, d_Y);
+            memcpy(d_X, h_train_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+            memcpy(d_Y, h_train_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-            matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-            relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
-
-            matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-            softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
-
-            evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
-
-            compute_dz2(d_O, d_Y, d_dZ2, BATCH_SIZE, OUTPUT_SIZE);
+            forward1(d_X, d_W1, d_H);
+            forward2_train(d_H, d_W2, d_O, d_Y, d_dZ2, train_loss_total, correct_train);
             
-            matMulTransposeA(d_H, d_dZ2, d_dW2, HIDDEN_SIZE, OUTPUT_SIZE, BATCH_SIZE);
-            matMulTransposeB(d_dZ2, d_W2, d_dH, BATCH_SIZE, HIDDEN_SIZE, OUTPUT_SIZE);
+            backward1(d_dZ2, d_W2, d_H, d_dZ1);
             
-            relu_backward(d_dH, d_H, d_dZ1, BATCH_SIZE * HIDDEN_SIZE);
-            matMulTransposeA(d_X, d_dZ1, d_dW1, INPUT_SIZE, HIDDEN_SIZE, BATCH_SIZE);
-
-            update_weights(d_W1, d_dW1, LEARNING_RATE, INPUT_SIZE * HIDDEN_SIZE);
-            update_weights(d_W2, d_dW2, LEARNING_RATE, HIDDEN_SIZE * OUTPUT_SIZE);
+            update_W2(d_H, d_dZ2, d_W2);
+            update_W1(d_X, d_dZ1, d_W1);
         }
 
         auto train_end = chrono::high_resolution_clock::now();
         chrono::duration<double> epoch_time = train_end - train_start;
         total_train_time += epoch_time.count();
 
-        correct_train = d_correct;
-        train_loss_total = d_loss;
         final_train_acc = (float)correct_train / (train_batches * BATCH_SIZE) * 100.0f;
         final_train_loss = train_loss_total / (train_batches * BATCH_SIZE);
 
-        // --- 2. VALIDATION PHASE ---
+        // --- VALIDATION PHASE ---
         int correct_val = 0;
         float val_loss_total = 0.0f;
-        d_correct = 0;
-        d_loss = 0.0f;
 
         for (int b = 0; b < val_batches; b++) {
-            copy(h_train_X + (train_samples + b * BATCH_SIZE) * INPUT_SIZE, h_train_X + (train_samples + (b + 1) * BATCH_SIZE) * INPUT_SIZE, d_X);
-            copy(h_train_Y + train_samples + b * BATCH_SIZE, h_train_Y + train_samples + (b + 1) * BATCH_SIZE, d_Y);
+            memcpy(d_X, h_train_X + (train_samples + b * BATCH_SIZE) * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+            memcpy(d_Y, h_train_Y + (train_samples + b * BATCH_SIZE), BATCH_SIZE * sizeof(float));
 
-            matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-            relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
-
-            matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-            softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
-
-            evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
+            forward1(d_X, d_W1, d_H);
+            forward2_eval(d_H, d_W2, d_O, d_Y, val_loss_total, correct_val);
         }
         
-        correct_val = d_correct;
-        val_loss_total = d_loss;
         final_val_acc = (float)correct_val / (val_batches * BATCH_SIZE) * 100.0f;
         final_val_loss = val_loss_total / (val_batches * BATCH_SIZE);
 
@@ -302,29 +330,18 @@ int main() {
                epoch + 1, EPOCHS, final_train_acc, final_val_acc, final_train_loss, final_val_loss);
     }
 
-    // ==========================================
-    // --- 3. FINAL TEST PHASE ---
-    // ==========================================
+    // --- FINAL TEST PHASE ---
     int correct_test = 0;
     float test_loss_total = 0.0f;
-    d_correct = 0;
-    d_loss = 0.0f;
 
     for (int b = 0; b < test_batches; b++) {
-        copy(h_test_X + b * BATCH_SIZE * INPUT_SIZE, h_test_X + (b + 1) * BATCH_SIZE * INPUT_SIZE, d_X);
-        copy(h_test_Y + b * BATCH_SIZE, h_test_Y + (b + 1) * BATCH_SIZE, d_Y);
+        memcpy(d_X, h_test_X + b * BATCH_SIZE * INPUT_SIZE, BATCH_SIZE * INPUT_SIZE * sizeof(float));
+        memcpy(d_Y, h_test_Y + b * BATCH_SIZE, BATCH_SIZE * sizeof(float));
 
-        matrixMul(d_X, d_W1, d_H, BATCH_SIZE, HIDDEN_SIZE, INPUT_SIZE);
-        relu(d_H, BATCH_SIZE * HIDDEN_SIZE);
-
-        matrixMul(d_H, d_W2, d_O, BATCH_SIZE, OUTPUT_SIZE, HIDDEN_SIZE);
-        softmax(d_O, BATCH_SIZE, OUTPUT_SIZE);
-
-        evaluate_loss_acc(d_O, d_Y, &d_loss, &d_correct, BATCH_SIZE, OUTPUT_SIZE);
+        forward1(d_X, d_W1, d_H);
+        forward2_eval(d_H, d_W2, d_O, d_Y, test_loss_total, correct_test);
     }
     
-    correct_test = d_correct;
-    test_loss_total = d_loss;
     final_test_acc = (float)correct_test / (test_batches * BATCH_SIZE) * 100.0f;
     final_test_loss = test_loss_total / (test_batches * BATCH_SIZE);
 
@@ -353,7 +370,7 @@ int main() {
     cout << "===============================================" << endl;
 
     delete[] d_X; delete[] d_Y; delete[] d_H; delete[] d_O;
-    delete[] d_dW1; delete[] d_dW2; delete[] d_dZ1; delete[] d_dZ2; delete[] d_dH;
+    delete[] d_dZ1; delete[] d_dZ2; 
     delete[] h_train_X; delete[] h_train_Y; delete[] h_test_X; delete[] h_test_Y;
     delete[] h_W1; delete[] h_W2;
 
