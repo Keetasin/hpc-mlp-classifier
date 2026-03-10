@@ -1,4 +1,4 @@
-Parallel Neural Network for Image Classification
+# Parallel Neural Network for Image Classification
 
 This project is part of the **High-Performance Computing Engineer Module** course at Prince of Songkla University, Hat Yai Campus. It demonstrates the development and acceleration of training a **Multilayer Perceptron (MLP)** model for image classification. We applied five different Parallel Computing techniques across various architectures to benchmark performance and resolve architecture-specific bottlenecks.
 
