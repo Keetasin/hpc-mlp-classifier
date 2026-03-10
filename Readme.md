@@ -2,6 +2,12 @@
 
 This project is part of the **High-Performance Computing Engineer Module** course at Prince of Songkla University, Hat Yai Campus. It demonstrates the development and acceleration of training a **Multilayer Perceptron (MLP)** model for image classification. We applied five different Parallel Computing techniques across various architectures to benchmark performance and resolve architecture-specific bottlenecks.
 
+## Dataset
+This project utilizes the **Fashion-MNIST** dataset, which consists of grayscale images of clothing items categorized into 10 distinct classes.
+* **Data Format:** 28x28 pixel images.
+* **Dataset Size:** 60,000 training examples and 10,000 testing examples.
+* **Source:** [Fashion-MNIST on Kaggle](https://www.kaggle.com/datasets/zalando-research/fashionmnist)
+  
 ## Model Architecture
 * **Input Layer:** 784 nodes (Supports 28x28 pixel images flattened into a 1D vector).
 * **Hidden Layer:** 256 nodes (Activation Function: ReLU).
